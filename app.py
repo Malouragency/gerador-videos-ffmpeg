@@ -5,14 +5,22 @@ import logging
 from datetime import datetime
 import subprocess
 import sys
+import requests
+from urllib.parse import urlparse
+import tempfile
+import shutil
 
+# Initialize Flask app
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['ALLOWED_EXTENSIONS'] = {'jpg', 'jpeg', 'png', 'mp3', 'wav'}
+app.config['MAX_FILE_AGE'] = 24 * 60 * 60  # 24 hours in seconds
+
+# Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Configuração de logs
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -24,52 +32,113 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def allowed_file(filename):
+    """Check if the file extension is allowed"""
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
 def check_ffmpeg():
-    """Verifica se o FFmpeg está instalado e acessível"""
+    """Verify FFmpeg is installed and accessible"""
     try:
-        subprocess.run(['ffmpeg', '-version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(['ffmpeg', '-version'], check=True, 
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(['ffprobe', '-version'], check=True,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.error(f"FFmpeg/FFprobe check failed: {str(e)}")
         return False
 
-def validate_media_files(image_path, audio_path):
-    """Verifica se os arquivos de mídia são válidos"""
+def download_remote_file(url, file_type):
+    """Download remote file with improved error handling and temp file management"""
     try:
-        # Verifica imagem
-        img_check = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream=codec_name,width,height', '-of', 'csv=p=0', image_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        # Validate URL
+        parsed = urlparse(url)
+        if not all([parsed.scheme, parsed.netloc]):
+            raise ValueError("Invalid URL format")
+
+        # Create temp file in upload folder
+        temp_ext = os.path.splitext(parsed.path)[1] or f'.{file_type}'
+        temp_file = tempfile.NamedTemporaryFile(
+            suffix=temp_ext,
+            dir=app.config['UPLOAD_FOLDER'],
+            delete=False
         )
-        
-        # Verifica áudio
-        audio_check = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'a:0',
-             '-show_entries', 'stream=codec_name,sample_rate,channels', '-of', 'csv=p=0', audio_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        
-        if img_check.returncode != 0:
-            logger.error(f"Invalid image file: {img_check.stderr.decode('utf-8')}")
-            return False
-        
-        if audio_check.returncode != 0:
-            logger.error(f"Invalid audio file: {audio_check.stderr.decode('utf-8')}")
-            return False
-            
-        return True
+        temp_path = temp_file.name
+        temp_file.close()
+
+        # Download with timeout and streaming
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(temp_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        logger.info(f"Successfully downloaded {url} to {temp_path}")
+        return temp_path
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Download failed for {url}: {str(e)}")
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return None
     except Exception as e:
-        logger.error(f"Error validating media files: {str(e)}")
-        return False
+        logger.error(f"Unexpected download error: {str(e)}")
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return None
+
+def validate_media_file(file_path, media_type):
+    """Validate media files using ffprobe with detailed error reporting"""
+    try:
+        if media_type == 'image':
+            cmd = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name,width,height,pix_fmt',
+                '-of', 'json',
+                file_path
+            ]
+        elif media_type == 'audio':
+            cmd = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'a:0',
+                '-show_entries', 'stream=codec_name,sample_rate,channels,duration',
+                '-of', 'json',
+                file_path
+            ]
+        else:
+            raise ValueError("Invalid media type")
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr.strip()
+            logger.error(f"Validation failed for {file_path} ({media_type}): {error_msg}")
+            return False, error_msg
+
+        return True, result.stdout
+
+    except subprocess.TimeoutExpired:
+        error_msg = "Validation timed out"
+        logger.error(f"Timeout validating {file_path} ({media_type})")
+        return False, error_msg
+    except Exception as e:
+        error_msg = f"Validation error: {str(e)}"
+        logger.error(f"Error validating {file_path} ({media_type}): {error_msg}")
+        return False, error_msg
 
 def generate_video(image_path, audio_path, output_path):
-    """Gera vídeo a partir de imagem e áudio usando FFmpeg"""
+    """Generate video from image and audio with robust error handling"""
     try:
         cmd = [
             'ffmpeg',
+            '-loglevel', 'error',
             '-loop', '1',
             '-framerate', '2',
             '-i', image_path,
@@ -87,154 +156,210 @@ def generate_video(image_path, audio_path, output_path):
             '-y',
             output_path
         ]
-        result = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=300)
-        logger.info(f"FFmpeg output: {result.stdout.decode('utf-8')}")
-        return True
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode('utf-8') if e.stderr else 'No error message'
-        logger.error(f"FFmpeg command failed: {' '.join(cmd)}")
-        logger.error(f"FFmpeg stderr: {error_msg}")
-        return False
-    except subprocess.TimeoutExpired:
-        logger.error("FFmpeg timeout expired")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error in generate_video: {str(e)}")
-        return False
+        
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300
+        )
 
-def generate_fallback_video(image_path, audio_path, output_path):
-    """Método alternativo mais simples para gerar vídeo"""
-    try:
-        cmd = [
-            'ffmpeg',
-            '-loop', '1',
-            '-i', image_path,
-            '-i', audio_path,
-            '-c:v', 'libx264',
-            '-c:a', 'aac',
-            '-strict', 'experimental',
-            '-shortest',
-            '-y',
-            output_path
-        ]
-        result = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=300)
-        logger.info(f"Fallback FFmpeg output: {result.stdout.decode('utf-8')}")
-        return True
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode('utf-8') if e.stderr else 'No error message'
-        logger.error(f"Fallback FFmpeg error: {error_msg}")
-        return False
+        if result.returncode != 0:
+            error_msg = result.stderr.strip()
+            logger.error(f"FFmpeg failed: {error_msg}")
+            return False, error_msg
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            error_msg = "Output file not created or empty"
+            logger.error(error_msg)
+            return False, error_msg
+
+        return True, "Video generated successfully"
+
     except subprocess.TimeoutExpired:
-        logger.error("Fallback FFmpeg timeout expired")
-        return False
+        error_msg = "FFmpeg timed out"
+        logger.error(error_msg)
+        return False, error_msg
     except Exception as e:
-        logger.error(f"Unexpected error in fallback video generation: {str(e)}")
-        return False
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(f"Video generation error: {error_msg}")
+        return False, error_msg
+
+def cleanup_old_files():
+    """Clean up files older than MAX_FILE_AGE"""
+    try:
+        now = datetime.now().timestamp()
+        for filename in os.listdir(app.config['UPLOAD_FOLDER']):
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file_age = now - os.path.getmtime(file_path)
+            if file_age > app.config['MAX_FILE_AGE']:
+                try:
+                    os.unlink(file_path)
+                    logger.info(f"Cleaned up old file: {filename}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up {filename}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {str(e)}")
 
 @app.before_request
 def log_request_info():
-    logger.info(f"Received {request.method} request to {request.path}")
+    """Log incoming requests"""
+    logger.info(f"Request: {request.method} {request.path}")
     if request.files:
         logger.info(f"Files received: {list(request.files.keys())}")
+    if request.json:
+        logger.info(f"JSON data received")
 
 @app.route('/generate', methods=['POST'])
 def handle_generation():
-    if not check_ffmpeg():
-        return jsonify({"error": "FFmpeg não está instalado ou não pôde ser executado"}), 500
+    """Handle video generation requests"""
+    cleanup_old_files()  # Clean up before processing new request
 
-    if not request.files:
-        return jsonify({"error": "Nenhum arquivo enviado"}), 400
+    # Check FFmpeg availability
+    if not check_ffmpeg():
+        return jsonify({
+            "error": "Server configuration error",
+            "message": "FFmpeg not available"
+        }), 500
+
+    # Initialize variables
+    saved_files = {}
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    errors = []
 
     try:
-        saved_files = {}
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        for field in ['image', 'audio']:
-            if field not in request.files:
-                return jsonify({"error": f"Arquivo {field} faltando"}), 400
-            
-            file = request.files[field]
+        # Process image (either file upload or URL)
+        if 'image' in request.files:
+            file = request.files['image']
             if file.filename == '':
-                return jsonify({"error": f"Nome de arquivo vazio para {field}"}), 400
-            
-            if not allowed_file(file.filename):
-                return jsonify({"error": f"Tipo de arquivo não permitido para {field}"}), 400
-            
-            ext = file.filename.rsplit('.', 1)[1].lower()
-            filename = f"{field}_{timestamp}.{ext}"
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename))
-            
-            try:
+                errors.append("Empty image filename")
+            elif not allowed_file(file.filename):
+                errors.append("Invalid image file type")
+            else:
+                ext = file.filename.rsplit('.', 1)[1].lower()
+                filename = f"image_{timestamp}.{ext}"
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename))
                 file.save(filepath)
-                saved_files[field] = filepath
-            except Exception as e:
-                logger.error(f"Error saving {field} file: {str(e)}")
-                return jsonify({"error": f"Falha ao salvar arquivo {field}"}), 500
+                saved_files['image'] = filepath
+        elif request.json and 'image' in request.json:
+            filepath = download_remote_file(request.json['image'], 'image')
+            if filepath:
+                saved_files['image'] = filepath
+            else:
+                errors.append("Failed to download image URL")
+        else:
+            errors.append("Missing image (file or URL)")
 
-        # Valida os arquivos antes de processar
-        if not validate_media_files(saved_files['image'], saved_files['audio']):
-            return jsonify({"error": "Arquivos de imagem ou áudio inválidos"}), 400
+        # Process audio (either file upload or URL)
+        if 'audio' in request.files:
+            file = request.files['audio']
+            if file.filename == '':
+                errors.append("Empty audio filename")
+            elif not allowed_file(file.filename):
+                errors.append("Invalid audio file type")
+            else:
+                ext = file.filename.rsplit('.', 1)[1].lower()
+                filename = f"audio_{timestamp}.{ext}"
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename))
+                file.save(filepath)
+                saved_files['audio'] = filepath
+        elif request.json and 'audio' in request.json:
+            filepath = download_remote_file(request.json['audio'], 'audio')
+            if filepath:
+                saved_files['audio'] = filepath
+            else:
+                errors.append("Failed to download audio URL")
+        else:
+            errors.append("Missing audio (file or URL)")
 
-        # Gera vídeo
+        # Return errors if any
+        if errors:
+            return jsonify({
+                "error": "Invalid request",
+                "messages": errors
+            }), 400
+
+        # Validate media files
+        image_valid, image_info = validate_media_file(saved_files['image'], 'image')
+        audio_valid, audio_info = validate_media_file(saved_files['audio'], 'audio')
+
+        if not image_valid or not audio_valid:
+            return jsonify({
+                "error": "Invalid media files",
+                "image_error": None if image_valid else image_info,
+                "audio_error": None if audio_valid else audio_info
+            }), 400
+
+        # Generate video
         video_filename = f"video_{timestamp}.mp4"
         video_path = os.path.join(app.config['UPLOAD_FOLDER'], video_filename)
-        
-        if not generate_video(saved_files['image'], saved_files['audio'], video_path):
-            logger.info("Trying fallback FFmpeg command")
-            if not generate_fallback_video(saved_files['image'], saved_files['audio'], video_path):
-                return jsonify({"error": "Falha ao gerar vídeo. Verifique os logs do servidor."}), 500
 
-        # Verifica se o vídeo foi criado
-        if not os.path.exists(video_path):
-            logger.error(f"Video file not created at expected path: {video_path}")
-            return jsonify({"error": "Vídeo não foi gerado corretamente"}), 500
+        success, message = generate_video(saved_files['image'], saved_files['audio'], video_path)
+        if not success:
+            return jsonify({
+                "error": "Video generation failed",
+                "message": message
+            }), 500
 
-        # Retorna URLs públicas
+        # Return success response
         base_url = request.host_url.rstrip('/')
         return jsonify({
             "status": "success",
-            "download_url": f"{base_url}/download/{video_filename}",
-            "files": {
-                "image": f"{base_url}/download/{os.pathasename(saved_files['image'])}",
-                "audio": f"{base_url}/download/{os.path.basename(saved_files['audio'])}",
-                "video": video_filename
+            "video_url": f"{base_url}/download/{video_filename}",
+            "metadata": {
+                "image": json.loads(image_info),
+                "audio": json.loads(audio_info),
+                "video_size": os.path.getsize(video_path),
+                "duration": json.loads(audio_info)['streams'][0]['duration']
             }
         })
 
     except Exception as e:
-        logger.exception(f"Unexpected error in handle_generation: {str(e)}")
-        return jsonify({"error": "Erro interno do servidor"}), 500
+        logger.exception("Unexpected error in video generation")
+        return jsonify({
+            "error": "Internal server error",
+            "message": str(e)
+        }), 500
 
 @app.route('/download/<filename>')
 def download_file(filename):
+    """Serve generated files"""
     try:
         return send_from_directory(
             app.config['UPLOAD_FOLDER'],
             secure_filename(filename),
-            as_attachment=False
+            as_attachment=True,
+            mimetype='video/mp4' if filename.endswith('.mp4') else None
         )
     except FileNotFoundError:
-        return jsonify({"error": "Arquivo não encontrado"}), 404
+        return jsonify({"error": "File not found"}), 404
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        return jsonify({"error": "File download failed"}), 500
 
 @app.route('/healthcheck')
 def health_check():
-    return jsonify({
+    """System health check endpoint"""
+    status = {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "service": "video-generator",
         "ffmpeg_available": check_ffmpeg(),
-        "upload_folder_writable": os.access(app.config['UPLOAD_FOLDER'], os.W_OK)
-    })
+        "disk_space": shutil.disk_usage(app.config['UPLOAD_FOLDER'])._asdict(),
+        "file_count": len(os.listdir(app.config['UPLOAD_FOLDER']))
+    }
+    return jsonify(status)
 
 if __name__ == '__main__':
-    # Verifica permissões da pasta de uploads
+    # Verify system requirements
     if not os.access(app.config['UPLOAD_FOLDER'], os.W_OK):
-        logger.error(f"Upload folder is not writable: {app.config['UPLOAD_FOLDER']}")
+        logger.error("Upload directory is not writable")
         sys.exit(1)
     
-    # Verifica FFmpeg antes de iniciar
     if not check_ffmpeg():
-        logger.error("FFmpeg is not available. Please install FFmpeg first.")
+        logger.error("FFmpeg/FFprobe not found. Please install first.")
         sys.exit(1)
     
-    app.run(host='0.0.0.0', port=10000, debug=True)
+    # Start the application
+    app.run(host='0.0.0.0', port=10000, threaded=True)
