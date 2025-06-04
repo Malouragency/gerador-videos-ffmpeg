@@ -13,7 +13,7 @@ def generate_video():
         img.save(f'img{i+1}.jpg')
 
     cmd = [
-        'ffmpeg', '-i', 'audio.mp3',
+        'ffmpeg', '-i', 'audio.wav',
         *[f'-loop 1 -i img{i+1}.jpg' for i in range(5)],
         '-filter_complex',
         ';'.join([
