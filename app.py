@@ -8,7 +8,7 @@ def generate_video():
     audio = request.files['audio']
     images = [request.files[f'image{i}'] for i in range(1, 6)]
     
-    audio.save('audio.mp3')
+    audio.save('audio.wav')
     for i, img in enumerate(images):
         img.save(f'img{i+1}.jpg')
 
