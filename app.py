@@ -15,7 +15,11 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # Configuração de logs
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('video_generator.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -31,11 +35,35 @@ def check_ffmpeg():
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-@app.before_request
-def log_request_info():
-    logger.info(f"Received {request.method} request to {request.path}")
-    if request.files:
-        logger.info(f"Files received: {list(request.files.keys())}")
+def validate_media_files(image_path, audio_path):
+    """Verifica se os arquivos de mídia são válidos"""
+    try:
+        # Verifica imagem
+        img_check = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_name,width,height', '-of', 'csv=p=0', image_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        
+        # Verifica áudio
+        audio_check = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a:0',
+             '-show_entries', 'stream=codec_name,sample_rate,channels', '-of', 'csv=p=0', audio_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        
+        if img_check.returncode != 0:
+            logger.error(f"Invalid image file: {img_check.stderr.decode('utf-8')}")
+            return False
+        
+        if audio_check.returncode != 0:
+            logger.error(f"Invalid audio file: {audio_check.stderr.decode('utf-8')}")
+            return False
+            
+        return True
+    except Exception as e:
+        logger.error(f"Error validating media files: {str(e)}")
+        return False
 
 def generate_video(image_path, audio_path, output_path):
     """Gera vídeo a partir de imagem e áudio usando FFmpeg"""
@@ -43,31 +71,74 @@ def generate_video(image_path, audio_path, output_path):
         cmd = [
             'ffmpeg',
             '-loop', '1',
+            '-framerate', '2',
             '-i', image_path,
             '-i', audio_path,
             '-c:v', 'libx264',
+            '-preset', 'fast',
             '-tune', 'stillimage',
+            '-crf', '23',
             '-c:a', 'aac',
             '-b:a', '192k',
             '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
             '-shortest',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
             '-y',
             output_path
         ]
-        result = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        result = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=300)
         logger.info(f"FFmpeg output: {result.stdout.decode('utf-8')}")
         return True
     except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode('utf-8') if e.stderr else 'No error message'
         logger.error(f"FFmpeg command failed: {' '.join(cmd)}")
-        logger.error(f"FFmpeg stderr: {e.stderr.decode('utf-8')}")
+        logger.error(f"FFmpeg stderr: {error_msg}")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg timeout expired")
         return False
     except Exception as e:
         logger.error(f"Unexpected error in generate_video: {str(e)}")
         return False
 
+def generate_fallback_video(image_path, audio_path, output_path):
+    """Método alternativo mais simples para gerar vídeo"""
+    try:
+        cmd = [
+            'ffmpeg',
+            '-loop', '1',
+            '-i', image_path,
+            '-i', audio_path,
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-strict', 'experimental',
+            '-shortest',
+            '-y',
+            output_path
+        ]
+        result = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=300)
+        logger.info(f"Fallback FFmpeg output: {result.stdout.decode('utf-8')}")
+        return True
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode('utf-8') if e.stderr else 'No error message'
+        logger.error(f"Fallback FFmpeg error: {error_msg}")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("Fallback FFmpeg timeout expired")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error in fallback video generation: {str(e)}")
+        return False
+
+@app.before_request
+def log_request_info():
+    logger.info(f"Received {request.method} request to {request.path}")
+    if request.files:
+        logger.info(f"Files received: {list(request.files.keys())}")
+
 @app.route('/generate', methods=['POST'])
 def handle_generation():
-    # Verifica FFmpeg antes de processar
     if not check_ffmpeg():
         return jsonify({"error": "FFmpeg não está instalado ou não pôde ser executado"}), 500
 
@@ -78,7 +149,6 @@ def handle_generation():
         saved_files = {}
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Processa cada arquivo
         for field in ['image', 'audio']:
             if field not in request.files:
                 return jsonify({"error": f"Arquivo {field} faltando"}), 400
@@ -101,12 +171,18 @@ def handle_generation():
                 logger.error(f"Error saving {field} file: {str(e)}")
                 return jsonify({"error": f"Falha ao salvar arquivo {field}"}), 500
 
+        # Valida os arquivos antes de processar
+        if not validate_media_files(saved_files['image'], saved_files['audio']):
+            return jsonify({"error": "Arquivos de imagem ou áudio inválidos"}), 400
+
         # Gera vídeo
         video_filename = f"video_{timestamp}.mp4"
         video_path = os.path.join(app.config['UPLOAD_FOLDER'], video_filename)
         
         if not generate_video(saved_files['image'], saved_files['audio'], video_path):
-            return jsonify({"error": "Falha ao gerar vídeo. Verifique os logs do servidor."}), 500
+            logger.info("Trying fallback FFmpeg command")
+            if not generate_fallback_video(saved_files['image'], saved_files['audio'], video_path):
+                return jsonify({"error": "Falha ao gerar vídeo. Verifique os logs do servidor."}), 500
 
         # Verifica se o vídeo foi criado
         if not os.path.exists(video_path):
@@ -119,7 +195,7 @@ def handle_generation():
             "status": "success",
             "download_url": f"{base_url}/download/{video_filename}",
             "files": {
-                "image": f"{base_url}/download/{os.path.basename(saved_files['image'])}",
+                "image": f"{base_url}/download/{os.pathasename(saved_files['image'])}",
                 "audio": f"{base_url}/download/{os.path.basename(saved_files['audio'])}",
                 "video": video_filename
             }
@@ -146,7 +222,8 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "service": "video-generator",
-        "ffmpeg_available": check_ffmpeg()
+        "ffmpeg_available": check_ffmpeg(),
+        "upload_folder_writable": os.access(app.config['UPLOAD_FOLDER'], os.W_OK)
     })
 
 if __name__ == '__main__':
